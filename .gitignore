@@ -1,0 +1,102 @@
+# ==========================================
+# 🔒 СЕКРЕТЫ, КЛЮЧИ И КОНФИГИ
+# ==========================================
+*.env
+.env.*
+.env.local
+.env.production
+.env.staging
+.env.development
+**databases*/
+
+# Сертификаты и приватные ключи
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+.ssh/
+ssh/id_*
+ssh/known_hosts
+
+# Конфигурационные файлы с секретами
+config/secrets.yml
+config/secrets.json
+config/credentials.yml.enc
+config/database.yml
+config/auth.json
+.aws/
+aws/credentials
+aws/config
+.gcp/
+*.kubeconfig
+kubeconfig
+azure.json
+terraform.tfstate
+terraform.tfstate.backup
+.terraform/
+
+# ==========================================
+# 🗄️ ЛОКАЛЬНЫЕ ДАННЫЕ И КЭШ
+# ==========================================
+*.db
+*.sqlite*
+*.sqlite3
+dump.sql
+backup.sql
+*.dump
+node_modules/
+vendor/
+.cache/
+.tmp/
+temp/
+tmp/
+
+# ==========================================
+# 📝 ЛОГИ И ВРЕМЕННЫЕ ФАЙЛЫ
+# ==========================================
+*.log
+logs/
+error_log
+access_log
+*.pid
+*.lock
+
+# ==========================================
+# 🛠️ IDE, РЕДАКТОРЫ И ОС-СПЕЦИФИКА
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# 📦 СБОРКА И АРТЕФАКТЫ
+# ==========================================
+dist/
+build/
+out/
+target/
+bin/
+obj/
+*.class
+*.pyc
+__pycache__/
+*.egg-info/
+.pip/
+
+# ==========================================
+# 📄 ПРОЕКТНЫЕ ФАЙЛЫ (НЕ ДЛЯ ПУБЛИКАЦИИ)
+# ==========================================
+requests/
+recomendation/
+graphify-out/
+.graphifyignore
+.freebuff
+AGENTS.md
