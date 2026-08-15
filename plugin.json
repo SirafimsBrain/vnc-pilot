@@ -1,0 +1,8 @@
+{
+  "id": "vnc",
+  "name": "VNC",
+  "version": "0.1.0",
+  "homepage": "https://github.com/SirafimsBrain/vnc-pilot",
+  "api_version": 1,
+  "permissions": ["keyring", "process"]
+}
