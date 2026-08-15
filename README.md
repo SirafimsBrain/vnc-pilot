@@ -1,98 +1,100 @@
 # VNC Pilot — SSH Pilot Plugin
 
-Визуальное расширение плагина rdp-pilot для протокола VNC. Позволяет запускать
-VNC-соединения из SSH Pilot с выбором установленного в системе VNC-клиента и
-набором общих + клиент-специфичных настроек.
+A VNC protocol plugin for [SSH Pilot](https://github.com/mfat/sshpilot), modeled
+after [rdp-pilot](https://github.com/SirafimsBrain/rdp-pilot). It lets you launch
+VNC connections from SSH Pilot with automatic detection of the installed VNC
+client and a set of shared plus client-specific settings.
 
-## Поддерживаемые клиенты (v0.1)
+## Supported clients (v0.1)
 
-| ID        | Бинарники                         | Комментарий                                  |
-|-----------|-----------------------------------|----------------------------------------------|
-| `tigervnc` | `vncviewer`, `xtigervncviewer`   | Самый распространённый CLI-клиент            |
-| `turbovnc` | `vncviewer`, `tvncviewer`        | Высокая производительность                   |
-| `tightvnc` | `vncviewer`, `xtightvncviewer`   | Старый, но всё ещё встречается               |
-| `realvnc` | `vncviewer`                       | Коммерческий; CLI отличается                 |
-| `remmina` | `remmina`                         | GUI-мультипротокол; запуск через `.remmina`-файл |
-| `krdc`    | `krdc`                            | KDE Remote Desktop Client                    |
-| `vinagre` | `vinagre`                         | GNOME (устаревает в пользу Connections)      |
-| `gvncviewer` | `gvncviewer`                   | gtk-vnc                                      |
-| `custom`  | путь из `VNC_PILOT_BIN`           | Произвольный бинарь + raw extra args         |
+| ID        | Binaries                      | Notes                                    |
+|-----------|-------------------------------|------------------------------------------|
+| `tigervnc` | `vncviewer`, `xtigervncviewer` | Most common CLI client                   |
+| `turbovnc` | `vncviewer`, `tvncviewer`    | High performance; CLI similar to TigerVNC |
+| `tightvnc` | `vncviewer`, `xtightvncviewer` | Older client, still in use              |
+| `realvnc` | `vncviewer`                     | Commercial; different CLI               |
+| `remmina` | `remmina`                       | GUI multi-protocol; launched via `.remmina` profile file |
+| `krdc`    | `krdc`                          | KDE Remote Desktop Client               |
+| `vinagre` | `vinagre`                       | GNOME (being replaced by Connections)   |
+| `gvncviewer` | `gvncviewer`                | gtk-vnc                                 |
+| `custom`  | path from `VNC_PILOT_BIN`       | Arbitrary binary + raw extra args       |
 
-### Детекция
+### Detection
 
-Для всех клиентов используется **версионный fingerprint**: бинарник ищется по
-`PATH`, затем выполняется `--version` / `-version` и результат сопоставляется с
-белым списком маркеров (например, `TigerVNC`, `TurboVNC`, `RealVNC`).
+All clients are detected via **version fingerprinting**: the binary is found
+through `PATH`, then `--version` / `-version` output is compared against a
+whitelist of markers (e.g. `TigerVNC`, `TurboVNC`, `RealVNC`).
 
-**Важно:** имя `vncviewer` конфликтует между TigerVNC / TurboVNC / TightVNC /
-RealVNC. Детекция по версии разрешает конфликт.
+**Important:** the name `vncviewer` is shared by TigerVNC / TurboVNC / TightVNC
+/ RealVNC. Version detection resolves the conflict.
 
-## Переменные окружения
+## Environment variables
 
-| Переменная        | Описание                                              |
+| Variable        | Description                                              |
 |-------------------|-------------------------------------------------------|
-| `VNC_PILOT_BIN`   | Путь к пользовательскому VNC-клиенту (переопределяет авто-детекцию) |
-| `VNC_PILOT_CLIENT`| ID клиента из whitelist для форсированного выбора     |
+| `VNC_PILOT_BIN`   | Path to a custom VNC client (overrides auto-detection) |
+| `VNC_PILOT_CLIENT`| Force a specific client from the whitelist            |
 
-## Установка
+## Installation
 
 ```bash
-# Обычная установка
+# Standard installation
 mkdir -p ~/.local/share/sshpilot/plugins/vnc/
 cp __init__.py plugin.json ~/.local/share/sshpilot/plugins/vnc/
 
-# Flatpak-путь (если SSH Pilot запущен в Flatpak)
+# Flatpak (if SSH Pilot runs as a Flatpak)
 flatpak override --user --talk-name=org.freedesktop.Flatpak \
   org.mfat.sshpilot
 ```
 
-## Поля подключения
+## Connection fields
 
-### Общие (всегда видны)
+### Common fields (always visible)
 
-| key           | тип     | label             | по умолчанию |
-|---------------|---------|-------------------|--------------|
-| `host`        | text    | IP / HOSTNAME     | (обязательно)|
-| `port`        | int     | Port              | 5900         |
-| `display`     | int     | Display number    |              |
-| `username`    | text    | Username          |              |
-| `credential`  | password| Password          | keyring      |
-| `vnc_client`  | choice  | VNC Client        | auto         |
-| `view_only`   | switch  | View only         | выкл.        |
-| `fullscreen`  | switch  | Fullscreen        | выкл.        |
-| `shared`      | switch  | Shared session    | вкл.         |
-| `quality`     | choice  | Quality / JPEG    | auto         |
-| `compress`    | choice  | Compression level | auto         |
-| `encoding`    | choice  | Preferred encoding| auto         |
-| `color_depth` | choice  | Color depth       | auto         |
-| `extra_args`  | text    | Extra CLI args    |              |
+| key           | type    | label             | default     |
+|---------------|---------|-------------------|-------------|
+| `host`        | text    | IP / HOSTNAME     | *(required)*|
+| `port`        | int     | Port              | 5900        |
+| `display`     | int     | Display number    |             |
+| `username`    | text    | Username          |             |
+| `credential`  | password| Password          | keyring     |
+| `vnc_client`  | choice  | VNC Client        | auto        |
+| `view_only`   | switch  | View only         | off         |
+| `fullscreen`  | switch  | Fullscreen        | off         |
+| `shared`      | switch  | Shared session    | on          |
+| `quality`     | choice  | Quality / JPEG    | auto        |
+| `compress`    | choice  | Compression level | auto        |
+| `encoding`    | choice  | Preferred encoding| auto        |
+| `color_depth` | choice  | Color depth       | auto        |
+| `extra_args`  | text    | Extra CLI args    |             |
 
-### Клиент-специфичные группы
+### Client-specific groups
 
-Поля сгруппированы по клиенту (`group="TigerVNC"`, `group="TurboVNC"`,
-`group="Remmina"`, `group="Custom"`). **Поля групп других клиентов
-игнорируются** при сборке argv — используются только поля для выбранного
-`vnc_client`.
+Fields are grouped by client (`group="TigerVNC"`, `group="TurboVNC"`,
+`group="Remmina"`, `group="Custom"`). **Fields from other client groups are
+ignored** when building `argv` — only the fields relevant to the selected
+`vnc_client` are used.
 
-## Ограничения (v0.1)
+## Limitations (v0.1)
 
-- **Window title:** не все клиенты поддерживают задание заголовка окна.
-  Remmina использует `nickname` как имя профиля; TigerVNC/TurboVNC/TightVNC —
-  нет стандартного флага.
-- **Пароль:** VNC-клиенты не принимают пароль в argv. Плагин создаёт временный
-  passwd-файл с `chmod 0o600` и удаляет его через `atexit`.
-- **Динамические поля:** `connection_fields()` возвращает статический список.
-  Скрытие нерелевантных групп в UI — nice-to-have в v0.2 при наличии хука.
-- **RealVNC:** коммерческий, лицензионные ограничения. Базовая поддержка
-  добавлена, продвинутые опции — в v0.2.
+- **Window title:** not all clients support setting a window title. Remmina
+  uses the connection nickname as the profile name; TigerVNC/TurboVNC/TightVNC
+  have no standard flag.
+- **Password:** VNC clients rarely accept a password via `argv`. The plugin
+  creates a temporary passwd file with `chmod 0o600` and removes it via `atexit`.
+- **Static fields:** `connection_fields()` returns a static list. Hiding
+  irrelevant groups in the UI is a nice-to-have for v0.2 if a stable SDK hook
+  becomes available.
+- **RealVNC:** commercial with licensing restrictions. Basic support is
+  included; advanced options are deferred to v0.2.
 
-## Тесты
+## Tests
 
 ```bash
-cd "/DISK1/projects/sshpilot_plugin/VNC Pilot"
+cd "/path/to/vnc-pilot"
 python3 -m pytest tests/ -v
 ```
 
-## Лицензия
+## License
 
-MIT. См. [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
