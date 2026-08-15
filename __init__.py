@@ -4,13 +4,15 @@ SSH Pilot Plugin: VNC Protocol Backend
 
 from __future__ import annotations
 
+import atexit
 import functools
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
-import atexit
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +27,17 @@ from sshpilot.plugins.api import (
 
 logger = logging.getLogger(__name__)
 
+# The VNC protocol's challenge/response authentication derives its DES key
+# from the first 8 characters of the password; longer passwords are silently
+# truncated by every client, so we mirror that behaviour consistently.
+VNC_PASSWORD_MAX = 8
+
+# How long a client-discovery result is considered fresh. Long enough that
+# opening the connection dialog stays fast, short enough that a client
+# installed while SSH Pilot is running is picked up on the next dialog open.
+_DISCOVERY_TTL_SECONDS = 30.0
+
+
 # ---------------------------------------------------------------------------
 # Client definitions
 # ---------------------------------------------------------------------------
@@ -33,58 +46,67 @@ KNOWN_CLIENTS: dict[str, dict] = {
     "tigervnc": {
         "binaries": ["vncviewer", "xtigervncviewer"],
         "version_markers": ["TigerVNC"],
-        "version_flags": ["-version", "--version"],
         "preferred": True,
     },
     "turbovnc": {
         "binaries": ["vncviewer", "tvncviewer"],
         "version_markers": ["TurboVNC"],
-        "version_flags": ["-version", "--version"],
         "preferred": True,
     },
     "tightvnc": {
         "binaries": ["vncviewer", "xtightvncviewer"],
         "version_markers": ["TightVNC"],
-        "version_flags": ["-version", "--version", "-help"],
         "preferred": False,
     },
     "realvnc": {
         "binaries": ["vncviewer"],
         "version_markers": ["RealVNC"],
-        "version_flags": ["-version", "--version"],
         "preferred": False,
     },
     "remmina": {
         "binaries": ["remmina"],
         "version_markers": ["Remmina"],
-        "version_flags": ["--version"],
         "preferred": False,
     },
     "krdc": {
         "binaries": ["krdc"],
         "version_markers": ["krdc"],
-        "version_flags": ["--version"],
         "preferred": False,
     },
     "vinagre": {
         "binaries": ["vinagre"],
         "version_markers": ["vinagre"],
-        "version_flags": ["--version", "-v"],
         "preferred": False,
     },
     "gvncviewer": {
         "binaries": ["gvncviewer"],
         "version_markers": ["gvncviewer"],
-        "version_flags": ["--version"],
         "preferred": False,
     },
 }
 
-# Ordered by preference for auto-detection
+# Ordered by preference for auto-detection.
 _CLIENT_ORDER = [
     "tigervnc", "turbovnc", "tightvnc", "realvnc",
     "remmina", "krdc", "vinagre", "gvncviewer",
 ]
+
+# The plain ``vncviewer`` name is shared by TigerVNC, TurboVNC, TightVNC and
+# RealVNC. A binary with this name MUST be identified by its version output;
+# without it we refuse to guess, because the wrong client would receive the
+# wrong flags.
+_SHARED_BINARY_NAMES = frozenset({"vncviewer"})
+
+_DISPLAY_NAMES = {
+    "tigervnc": "TigerVNC",
+    "turbovnc": "TurboVNC",
+    "tightvnc": "TightVNC",
+    "realvnc": "RealVNC",
+    "remmina": "Remmina",
+    "krdc": "KRDC (KDE)",
+    "vinagre": "Vinagre (GNOME)",
+    "gvncviewer": "gvncviewer (gtk-vnc)",
+}
 
 # ---------------------------------------------------------------------------
 # Field choices (immutable)
@@ -124,8 +146,6 @@ _ENCODING = (
     ("ZRLE", "ZRLE"),
     ("Hextile", "Hextile"),
     ("Raw", "Raw"),
-    ("CoRRE", "CoRRE"),
-    ("Raw", "Raw"),
 )
 
 _COLOR_DEPTH = (
@@ -136,12 +156,17 @@ _COLOR_DEPTH = (
     ("32", "32-bit (16M+ colors)"),
 )
 
+# Remmina's quality key only distinguishes 0/1/2/9; everything else falls
+# back to its internal default. Map our 0-9 choices onto those values.
+_REMMINA_QUALITY = {"0": 0, "1": 1, "2": 2, "9": 9}
+
+
 # ---------------------------------------------------------------------------
-# Helpers (adapted from rdp-pilot)
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _parse_port(value: Any, default: int = 5900) -> int | None:
+def _parse_port(value: Any, default: int = 5900) -> Optional[int]:
     """Strictly parse a port value.
 
     Returns ``default`` when unset, ``None`` for anything that is not a valid
@@ -164,7 +189,7 @@ def _parse_port(value: Any, default: int = 5900) -> int | None:
     return None
 
 
-def _split_host_port(host: str) -> tuple[str, int | None]:
+def _split_host_port(host: str) -> tuple[str, Optional[int]]:
     """Split an optional ``:port`` suffix off a host, IPv6-aware."""
     host = (host or "").strip()
     if not host:
@@ -203,13 +228,29 @@ def _get_host(data: dict, connection: Any = None) -> str:
     return ""
 
 
+def _validate_host(host: str) -> Optional[str]:
+    """Return an error message for an unusable host, or ``None``."""
+    host = (host or "").strip()
+    if not host:
+        return "Host is required."
+    if host.startswith("-"):
+        return "Host must not start with '-' (it would be parsed as an option)."
+    if any(ch.isspace() for ch in host):
+        return "Host must not contain whitespace."
+    return None
+
+
 def _flatpak_prefix() -> tuple[str, ...]:
-    """Return flatpak-spawn prefix if running inside a Flatpak sandbox."""
-    if os.path.exists("/.flatpak-info"):
-        flatpak = shutil.which("flatpak-spawn")
-        if flatpak:
-            return (flatpak, "--host")
-        return ("flatpak-spawn", "--host")
+    """Return ``('flatpak-spawn', '--host')`` when running inside Flatpak."""
+    if not os.path.exists("/.flatpak-info"):
+        return ()
+    flatpak = shutil.which("flatpak-spawn")
+    if flatpak:
+        return (flatpak, "--host")
+    logger.warning(
+        "Running inside Flatpak but 'flatpak-spawn' was not found on PATH; "
+        "host VNC clients will not be reachable. Install flatpak-spawn or "
+        "run SSH Pilot outside Flatpak.")
     return ()
 
 
@@ -227,142 +268,154 @@ class VncClientInfo:
     argv_prefix: tuple[str, ...]
 
 
-def _run_version_command(path: str, flags: list[str]) -> str:
-    """Run the binary with version flags and return stdout+stderr text."""
-    for flag in flags:
+@functools.lru_cache(maxsize=32)
+def _version_output_for(path: str) -> str:
+    """Run ``--version``-style flags once per binary and cache the output.
+
+    The same ``vncviewer`` binary is probed by several candidate clients
+    during discovery; caching by path keeps that to a single short subprocess
+    run instead of a storm of them.
+    """
+    for flag in ("--version", "-version", "-help", "-v"):
         try:
             result = subprocess.run(
-                [path, flag],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            if output.strip():
-                return output
+                [path, flag], capture_output=True, text=True, timeout=1)
         except (subprocess.TimeoutExpired, OSError):
             continue
+        output = (result.stdout or "") + (result.stderr or "")
+        if output.strip():
+            return output
     return ""
 
 
-@functools.lru_cache(maxsize=8)
-def _discover_vnc_clients() -> tuple[VncClientInfo, ...]:
-    """Discover installed VNC clients by scanning PATH and matching version output.
+def _binary_matches(path: str, binary_name: str, spec: dict) -> bool:
+    """Decide whether a found binary really is the client described by spec.
 
-    Resolution order:
-    1. ``VNC_PILOT_BIN`` env override — user-specified binary, client set to 'custom'.
-    2. ``VNC_PILOT_CLIENT`` env override — force a specific known client by id.
-    3. Auto-scan: for each known client, check all its candidate binaries via
-       ``shutil.which`` and fingerprint with ``--version``/``-version``.
+    Version output is authoritative. When a binary produces no version output,
+    we only accept it if its name uniquely identifies the client: a shared
+    ``vncviewer`` that cannot be fingerprinted must not be silently matched
+    against TigerVNC / TurboVNC / TightVNC / RealVNC, because it would then
+    be launched with the wrong flags.
     """
+    output = _version_output_for(path)
+    if output.strip():
+        lowered = output.lower()
+        return any(marker.lower() in lowered for marker in spec["version_markers"])
+    return binary_name not in _SHARED_BINARY_NAMES
+
+
+def _display_name(client_id: str) -> str:
+    return _DISPLAY_NAMES.get(client_id, client_id.capitalize())
+
+
+_discovery_cache: Optional[tuple[float, tuple[VncClientInfo, ...]]] = None
+
+
+def _discover_vnc_clients() -> tuple[VncClientInfo, ...]:
+    """Discover installed VNC clients by scanning PATH and fingerprinting
+    their version output.
+
+    Results are cached for a short TTL so the connection dialog opens fast;
+    re-discovery after the TTL picks up clients installed while SSH Pilot is
+    running. There is deliberately no environment-variable override: the
+    client is chosen explicitly per connection (``vnc_client`` choice or
+    ``custom_binary`` path).
+    """
+    global _discovery_cache
+    now = time.monotonic()
+    if _discovery_cache is not None:
+        ts, cached = _discovery_cache
+        if now - ts < _DISCOVERY_TTL_SECONDS:
+            return cached
+
     flatpak = _flatpak_prefix()
     results: list[VncClientInfo] = []
-
-    override_bin = os.environ.get("VNC_PILOT_BIN", "").strip()
-    override_client = os.environ.get("VNC_PILOT_CLIENT", "").strip()
-
-    if override_bin:
-        results.append(VncClientInfo(
-            client_id="custom" if not override_client else override_client,
-            binary=override_bin,
-            display_name=os.path.basename(override_bin) or "custom",
-            argv_prefix=flatpak + (override_bin,),
-        ))
-        return tuple(results)
-
-    # Scan for each known client
     for client_id in _CLIENT_ORDER:
         spec = KNOWN_CLIENTS[client_id]
         for binary_name in spec["binaries"]:
             path = shutil.which(binary_name)
             if path is None:
                 continue
-            # Fingerprint: run version and check markers
-            version_output = _run_version_command(path, spec["version_flags"])
-            matched = False
-            if version_output:
-                for marker in spec["version_markers"]:
-                    if marker.lower() in version_output.lower():
-                        matched = True
-                        break
-            else:
-                # If we can't get version output, accept the binary as a fallback
-                # (e.g., remmina --version may not output "Remmina" on some builds)
-                matched = True
-            if matched:
-                display = client_id.capitalize() if client_id != "realvnc" else "RealVNC"
-                if client_id == "tightvnc":
-                    display = "TightVNC"
-                if client_id == "turbovnc":
-                    display = "TurboVNC"
-                if client_id == "tigervnc":
-                    display = "TigerVNC"
-                if client_id == "gvncviewer":
-                    display = "gvncviewer (gtk-vnc)"
-                if client_id == "krdc":
-                    display = "KRDC (KDE)"
-                if client_id == "vinagre":
-                    display = "Vinagre (GNOME)"
-                results.append(VncClientInfo(
-                    client_id=client_id,
-                    binary=path,
-                    display_name=display,
-                    argv_prefix=flatpak + (path,),
-                ))
-                # Don't break for the same client_id — first match wins per client
-                break
+            if not _binary_matches(path, binary_name, spec):
+                continue
+            results.append(VncClientInfo(
+                client_id=client_id,
+                binary=path,
+                display_name=_display_name(client_id),
+                argv_prefix=flatpak + (path,),
+            ))
+            break
 
-    if override_client and not any(c.client_id == override_client for c in results):
-        logger.warning(
-            "VNC_PILOT_CLIENT set to '%s' but that client was not found on PATH",
-            override_client,
-        )
-
-    return tuple(results)
+    result = tuple(results)
+    _discovery_cache = (now, result)
+    return result
 
 
-def _resolve_client(
-    data: dict, ctx: PluginContext
-) -> VncClientInfo:
-    """Pick the VNC client to use for a connection.
+def _discovery_cache_clear() -> None:
+    """Drop the cached discovery result (used by tests and after installs)."""
+    global _discovery_cache
+    _discovery_cache = None
 
-    Preference: explicit selection in data > VNC_PILOT_CLIENT > first discovered.
-    """
-    selected = data.get("vnc_client") or ""
-    discovered = _discover_vnc_clients()
 
-    if selected:
-        for c in discovered:
-            if c.client_id == selected:
-                return c
-        # User selected a client not in our discovered list; check env override path
-        if selected == "custom":
-            bin_path = os.environ.get("VNC_PILOT_BIN", "").strip()
-            if bin_path:
-                flatpak = _flatpak_prefix()
-                return VncClientInfo(
-                    client_id="custom",
-                    binary=bin_path,
-                    display_name=os.path.basename(bin_path) or "custom",
-                    argv_prefix=flatpak + (bin_path,),
-                )
+def _resolve_custom_binary(value: str) -> str:
+    """Resolve a per-connection custom VNC client path or name on PATH."""
+    value = (value or "").strip()
+    if not value:
+        raise ProtocolError("No custom VNC client path provided.")
+    if os.sep in value:
+        if not os.path.isfile(value) or not os.access(value, os.X_OK):
+            raise ProtocolError(
+                f"Custom VNC client '{value}' does not exist or is not executable.")
+        return value
+    path = shutil.which(value)
+    if path is None:
         raise ProtocolError(
-            f"VNC client '{selected}' is selected but not found on this system. "
-            "Install it or choose a different client, or unset VNC_PILOT_BIN."
+            f"Custom VNC client '{value}' was not found on PATH.")
+    return path
+
+
+def _resolve_client(data: dict) -> VncClientInfo:
+    """Pick the VNC client for a connection.
+
+    Priority: per-connection ``custom_binary`` path > explicit ``vnc_client``
+    selection > first preferred installed client.
+
+    There is deliberately no implicit "auto" mode: the user either picks an
+    installed client or a custom binary, or gets a clear error.
+    """
+    custom = (data.get("custom_binary") or "").strip()
+    if custom:
+        path = _resolve_custom_binary(custom)
+        return VncClientInfo(
+            client_id="custom",
+            binary=path,
+            display_name=os.path.basename(path) or "custom",
+            argv_prefix=_flatpak_prefix() + (path,),
         )
+
+    selected = (data.get("vnc_client") or "").strip()
+    discovered = _discover_vnc_clients()
+    if selected:
+        for client in discovered:
+            if client.client_id == selected:
+                return client
+        raise ProtocolError(
+            f"VNC client '{selected}' is not installed on this system. "
+            "Install it, choose another client, or set a custom binary path "
+            "for this connection.")
 
     if discovered:
-        # Prefer preferred clients, then fall back to first found
-        preferred = [c for c in discovered if c.client_id in ("tigervnc", "turbovnc")]
-        if preferred:
-            return preferred[0]
+        # Only reachable for connections saved before the client field had a
+        # default; pick deterministically but log so the choice is visible.
+        logger.warning(
+            "No VNC client was selected for this connection; using %s.",
+            discovered[0].display_name)
         return discovered[0]
 
     raise ProtocolError(
-        "No VNC client found on PATH. Install one of: "
-        "TigerVNC, TurboVNC, TightVNC, RealVNC, Remmina, KRDC, Vinagre, or gvncviewer. "
-        "Alternatively, set VNC_PILOT_BIN to point at a custom binary."
-    )
+        "No VNC client was found on this system. Install one of: "
+        "TigerVNC, TurboVNC, TightVNC, RealVNC, Remmina, KRDC, Vinagre, "
+        "gvncviewer — or set a custom binary path for this connection.")
 
 
 # ---------------------------------------------------------------------------
@@ -404,18 +457,54 @@ def _resolve_password(connection: Any, data: dict, ctx: PluginContext) -> str:
     return legacy
 
 
-def _create_passwd_file(password: str) -> Optional[str]:
-    """Create a temporary VNC password file.
+_TEMP_FILES: List[str] = []
+_TEMP_FILES_REGISTERED = False
 
-    Writes the password to a temp file with mode 0o600. The file is
-    removed via atexit. Some VNC viewers accept plain-text passwords in
-    the passwd file; for viewers that require the VNC-encrypted format,
-    we attempt to use ``vncpasswd -f`` if it is on PATH; otherwise the
-    plain text file is passed and the viewer handles (or prompts for)
-    the password.
+
+def _track_temp_file(path: str) -> None:
+    """Register a temp file for cleanup at interpreter exit / deactivate."""
+    global _TEMP_FILES_REGISTERED
+    _TEMP_FILES.append(path)
+    if not _TEMP_FILES_REGISTERED:
+        _TEMP_FILES_REGISTERED = True
+        atexit.register(_cleanup_temp_files)
+
+
+def _cleanup_temp_files() -> None:
+    for path in _TEMP_FILES:
+        _safe_remove(path)
+    _TEMP_FILES.clear()
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _create_passwd_file(password: str) -> Optional[str]:
+    """Create a temporary VNC password file (mode 0o600).
+
+    The password is converted with ``vncpasswd -f`` when available, producing
+    the DES-encrypted format that every CLI viewer expects. When conversion
+    is not possible we log a warning and fall back to a plain-text file:
+    a handful of viewers accept it, but the standard clients (TigerVNC,
+    TurboVNC, TightVNC, RealVNC) will fail authentication without the
+    encrypted format.
+
+    VNC passwords are limited to 8 characters by the protocol; longer
+    passwords are truncated with a warning, mirroring ``vncpasswd``.
     """
     if not password:
         return None
+    if len(password) > VNC_PASSWORD_MAX:
+        logger.warning(
+            "VNC passwords are limited to %d characters; the password was "
+            "truncated to match. Check the password set on the VNC server.",
+            VNC_PASSWORD_MAX)
+        password = password[:VNC_PASSWORD_MAX]
 
     fd, path = tempfile.mkstemp(prefix="vnc-pass-", suffix=".tmp")
     try:
@@ -423,9 +512,9 @@ def _create_passwd_file(password: str) -> Optional[str]:
             f.write(password)
         os.chmod(path, 0o600)
     except OSError:
+        logger.exception("Failed to write the temporary VNC password file")
         return None
 
-    # Try to convert to proper VNC passwd format using vncpasswd
     vncpasswd = shutil.which("vncpasswd")
     if vncpasswd:
         try:
@@ -439,149 +528,195 @@ def _create_passwd_file(password: str) -> Optional[str]:
             if result.stdout:
                 with open(path, "wb") as f:
                     f.write(result.stdout.encode())
+            else:
+                logger.warning(
+                    "vncpasswd produced no output; passing a plain-text "
+                    "password file, which standard viewers will reject.")
         except (subprocess.TimeoutExpired, OSError, ValueError):
-            # If conversion fails, the plain-text file is our fallback
-            pass
+            logger.warning(
+                "Failed to convert the password to VNC format with "
+                "vncpasswd; passing a plain-text password file instead.")
+    else:
+        logger.warning(
+            "vncpasswd was not found on PATH; passing a plain-text password "
+            "file, which standard viewers will reject. Install the VNC "
+            "client tools (vncpasswd) for reliable password authentication.")
 
-    atexit.register(lambda: _safe_remove(path))
+    _track_temp_file(path)
     return path
 
 
-def _safe_remove(path: str) -> None:
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except OSError:
-        pass
+# ---------------------------------------------------------------------------
+# Target / URI resolution
+# ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Target resolution
-# ---------------------------------------------------------------------------
+def _vnc_port(data: dict, host: str, default: int = 5900) -> int:
+    """Resolve the effective VNC port.
+
+    Priority: display number N (port 5900+N) > ``host:port`` suffix inside
+    the host field > the ``port`` field.
+    """
+    display = data.get("display")
+    if display is not None and str(display).strip() != "":
+        try:
+            d = int(display)
+            if d >= 0:
+                return 5900 + d
+        except (TypeError, ValueError):
+            pass
+    _, embedded = _split_host_port(host)
+    if embedded:
+        return embedded
+    port = _parse_port(data.get("port"), default)
+    return port if port is not None else default
 
 
 def _resolve_target(data: dict, host: str) -> str:
-    """Build the VNC target string (host:display or host::port).
-
-    VNC display numbering: display N maps to port 5900+N. If an explicit
-    port is given, use ``host::port``. If a display number is given,
-    use ``host:display``.
-    """
+    """Build the VNC target string: ``host:display`` or ``host::port``."""
+    host = (host or "").strip()
+    if not host:
+        return ""
     display = data.get("display")
-    if display is not None:
+    if display is not None and str(display).strip() != "":
         try:
             d = int(display)
             if d >= 0:
                 return f"{_format_host(host)}:{d}"
         except (TypeError, ValueError):
             pass
-
-    port = _parse_port(data.get("port"), 5900)
-    if port is None:
-        port = 5900
-
-    embedded_port = None
-    bare_host = host
-    if ":" in host and not host.startswith("["):
-        bare_host, embedded_port = _split_host_port(host)
-    if embedded_port:
-        return f"{_format_host(bare_host)}::{embedded_port}"
-
+    port = _vnc_port(data, host)
     return f"{_format_host(host)}::{port}"
 
 
+def _vnc_uri(data: dict, host: str) -> str:
+    """Build a ``vnc://host:port`` URI for GUI clients (KRDC, Vinagre)."""
+    host = (host or "").strip()
+    if not host:
+        return ""
+    bare, _ = _split_host_port(host)
+    port = _vnc_port(data, host)
+    return f"vnc://{_format_host(bare)}:{port}"
+
+
+def _extra_args_list(data: dict) -> List[str]:
+    """Split the raw ``extra_args`` field into argv tokens.
+
+    Unlike a plain ``str.split()``, this respects quotes so values like
+    ``-via "user@gateway"`` survive intact.
+    """
+    extra = (data.get("extra_args") or "").strip()
+    if not extra:
+        return []
+    try:
+        return shlex.split(extra)
+    except ValueError:
+        logger.warning(
+            "extra_args contains unbalanced quotes; falling back to plain "
+            "whitespace splitting.")
+        return extra.split()
+
+
 # ---------------------------------------------------------------------------
-# Per-client argv builders
+# Per-client argv builders (uniform signature: (client, data, password))
 # ---------------------------------------------------------------------------
 
 
 def _build_tiger_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for TigerVNC / TurboVNC (compatible CLIs).
+    """Build argv for TigerVNC (and its TurboVNC derivative).
 
-    Both use ``-flag value`` or ``-flag`` boolean style. Key flags:
-    -FullScreen, -ViewOnly, -Shared, -PreferredEncoding, -QualityLevel,
-    -CompressLevel, -geometry, -passwd, -via
+    TigerVNC and TurboVNC share a common heritage but their parameter sets
+    diverged; both are handled here, with TurboVNC's specific names used
+    where they differ (Encoding, Quality 1-100, DesktopSize, RecvClipboard,
+    SendClipboard, LocalCursor, JPEG, Colors).
     """
+    host = _get_host(data)
+    target = _resolve_target(data, host)
     argv = list(client.argv_prefix)
     argv.append(target)
+    is_turbo = client.client_id == "turbovnc"
 
     if data.get("view_only"):
         argv.append("-ViewOnly")
     if data.get("fullscreen"):
         argv.append("-FullScreen")
-    if data.get("shared", True):  # shared is on by default in VNC
-        argv.append("-Shared")
-    else:
-        argv.append("-NOShared")
+    # Both viewers use the -Shared / -Shared=0 boolean syntax.
+    argv.append("-Shared" if data.get("shared", True) else "-Shared=0")
 
-    encoding = data.get("encoding", "")
+    encoding = data.get("encoding")
     if encoding:
-        argv.append(f"-PreferredEncoding")
-        argv.append(encoding)
+        argv += (["-Encoding", str(encoding)] if is_turbo
+                 else ["-PreferredEncoding", str(encoding)])
 
-    quality = data.get("quality", "")
+    quality = data.get("quality")
     if quality:
-        argv.append(f"-QualityLevel")
-        argv.append(quality)
+        if is_turbo:
+            # TurboVNC's JPEG quality is 1-100; map our 0-9 choices onto it.
+            level = max(1, min(100, int(quality) * 10 + 5))
+            argv += ["-Quality", str(level)]
+        else:
+            argv += ["-QualityLevel", str(quality)]
 
-    compress = data.get("compress", "")
+    compress = data.get("compress")
     if compress:
-        argv.append(f"-CompressLevel")
-        argv.append(compress)
+        argv += ["-CompressLevel", str(compress)]
 
-    color_depth = data.get("color_depth", "")
+    color_depth = data.get("color_depth")
     if color_depth:
-        argv.append(f"-colorDepth")
-        argv.append(color_depth)
+        if is_turbo:
+            colors = {
+                "8": "256", "16": "65536",
+                "24": "16777216", "32": "16777216",
+            }.get(str(color_depth))
+            if colors:
+                argv += ["-Colors", colors]
+        elif str(color_depth) == "8":
+            # TigerVNC has no -colorDepth; 8-bit (256 colors) is the highest
+            # reduced color level it can force.
+            argv += ["-LowColorLevel", "2"]
+        elif str(color_depth) in ("24", "32"):
+            argv += ["-FullColor"]
+        # 16-bit has no TigerVNC equivalent; leave AutoSelect to decide.
 
     geometry = data.get("tigervnc_geometry") or data.get("turbovnc_geometry")
     if geometry:
-        argv.append(f"-geometry")
-        argv.append(geometry)
+        argv += (["-DesktopSize", str(geometry)] if is_turbo
+                 else ["-geometry", str(geometry)])
 
     via = data.get("tigervnc_via") or data.get("turbovnc_via")
     if via:
-        argv.append(f"-via")
-        argv.append(via)
+        argv += ["-via", str(via)]
 
     if not data.get("tigervnc_accept_clipboard", True):
-        argv.append("-AcceptClipboard")
-        argv.append("0")
+        argv.append("-RecvClipboard=0" if is_turbo else "-AcceptClipboard=0")
     if not data.get("tigervnc_send_clipboard", True):
-        argv.append("-SendClipboard")
-        argv.append("0")
+        argv.append("-SendClipboard=0" if is_turbo else "-SendClipboard=0")
 
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
+    if is_turbo:
+        # TurboVNC's JPEG is on by default; only force it explicitly on.
+        if data.get("turbovnc_jpeg"):
+            argv.append("-JPEG=1")
+        argv.append("-LocalCursor=1" if data.get("turbovnc_local", True) else "-LocalCursor=0")
+
+    argv += _extra_args_list(data)
 
     env = dict(os.environ)
-
     if password:
         passwd_file = _create_passwd_file(password)
         if passwd_file:
             argv.append("-passwd")
             argv.append(passwd_file)
-
     return argv, env
 
 
 def _build_tightvnc_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for TightVNC.
-
-    TightVNC shares many flags with TigerVNC but uses slightly different
-    flag names in some cases.
-    """
+    """Build argv for TightVNC (different flag names from TigerVNC)."""
+    host = _get_host(data)
+    target = _resolve_target(data, host)
     argv = list(client.argv_prefix)
     argv.append(target)
 
@@ -589,56 +724,44 @@ def _build_tightvnc_argv(
         argv.append("-viewonly")
     if data.get("fullscreen"):
         argv.append("-fullscreen")
-    if data.get("shared", True):
-        argv.append("-shared")
-    else:
-        argv.append("-noshared")
+    argv.append("-shared" if data.get("shared", True) else "-noshared")
 
-    encoding = data.get("encoding", "")
+    encoding = data.get("encoding")
     if encoding:
-        argv.append(f"-encodings")
-        argv.append(encoding)
-
-    quality = data.get("quality", "")
+        argv += ["-encodings", str(encoding)]
+    quality = data.get("quality")
     if quality:
-        argv.append(f"-quality")
-        argv.append(quality)
-
-    compress = data.get("compress", "")
+        argv += ["-quality", str(quality)]
+    compress = data.get("compress")
     if compress:
-        argv.append(f"-compresslevel")
-        argv.append(compress)
+        argv += ["-compresslevel", str(compress)]
 
-    color_depth = data.get("color_depth", "")
+    color_depth = data.get("color_depth")
     if color_depth:
-        argv.append(f"-bcolors")
-        argv.append(color_depth)
+        # TightVNC has no -bcolors; it exposes 8-bit (-bgr233) vs 24-bit
+        # (-truecolour) pixel formats.
+        argv.append("-bgr233" if str(color_depth) == "8" else "-truecolour")
 
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
+    argv += _extra_args_list(data)
 
     env = dict(os.environ)
-
     if password:
         passwd_file = _create_passwd_file(password)
         if passwd_file:
-            argv.append("-passwd")
-            argv.append(passwd_file)
-
+            argv += ["-passwd", passwd_file]
     return argv, env
 
 
 def _build_realvnc_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for RealVNC.
+    """Build argv for the RealVNC viewer.
 
-    RealVNC uses similar flags to TigerVNC but some differ.
+    Only options documented in the RealVNC viewer manual are used;
+    quality/compression levels are not exposed by RealVNC and are skipped.
     """
+    host = _get_host(data)
+    target = _resolve_target(data, host)
     argv = list(client.argv_prefix)
     argv.append(target)
 
@@ -649,224 +772,179 @@ def _build_realvnc_argv(
     if data.get("shared", True):
         argv.append("-Shared")
 
-    encoding = data.get("encoding", "")
-    if encoding:
-        argv.append(f"-PreferredEncoding")
-        argv.append(encoding)
+    encoding = data.get("encoding")
+    # RealVNC only documents ZRLE / hextile / raw for -PreferredEncoding.
+    if encoding and str(encoding) != "Tight":
+        argv += ["-PreferredEncoding", str(encoding)]
 
-    quality = data.get("quality", "")
-    if quality:
-        argv.append(f"-QualityLevel")
-        argv.append(quality)
+    via = data.get("tigervnc_via") or data.get("turbovnc_via")
+    if via:
+        argv += ["-via", str(via)]
 
-    compress = data.get("compress", "")
-    if compress:
-        argv.append(f"-CompressLevel")
-        argv.append(compress)
-
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
+    argv += _extra_args_list(data)
 
     env = dict(os.environ)
-
     if password:
         passwd_file = _create_passwd_file(password)
         if passwd_file:
-            argv.append("-passwd")
-            argv.append(passwd_file)
-
+            argv += ["-passwd", passwd_file]
     return argv, env
+
+
+def _profile_value(value: Any) -> str:
+    """Sanitize a value for a GLib-style .remmina key file."""
+    return str(value).replace("\n", " ").replace("\r", " ").strip()
+
+
+def _write_temp_profile(lines: List[str]) -> Optional[str]:
+    fd, path = tempfile.mkstemp(prefix="remmina-vnc-", suffix=".remmina")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.exception("Failed to write the temporary Remmina profile")
+        _safe_remove(path)
+        return None
+    _track_temp_file(path)
+    return path
 
 
 def _build_remmina_argv(
-    client: VncClientInfo,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for Remmina.
+    """Build argv for Remmina (>= 1.4) via a temporary .remmina profile.
 
-    Remmina is a GUI multi-protocol client. It can be launched with a
-    VNC URI: ``remmina -c vnc://[user@]host:port``. Most settings live
-    in a profile file; we generate a temporary .remmina file for full
-    control.
+    The profile is generated with the keys Remmina's VNC plugin reads:
+    ``server=host:port`` (Remmina parses the port itself), ``username``,
+    ``password``, ``viewonly``, ``quality``, ``colordepth`` and
+    ``viewmode=2`` for fullscreen. ``extra_args`` has no equivalent in
+    Remmina profiles and is intentionally not applied.
     """
     host = _get_host(data)
-    port = _parse_port(data.get("port"), 5900) or 5900
-    display = data.get("display")
-    if display is not None:
-        try:
-            d = int(display)
-            if d >= 0:
-                port = 5900 + d
-        except (TypeError, ValueError):
-            pass
-
+    if not host:
+        raise ProtocolError("No host configured for this connection.")
+    port = _vnc_port(data, host)
     username = data.get("username") or ""
 
-    # Build a .remmina profile file
-    profile_content = "[remmina]\n"
-    profile_content += "name=VNC Pilot\n"
-    profile_content += "protocol=VNC\n"
-    profile_content += f"server={_format_host(host)}\n"
-    profile_content += f"port={port}\n"
-
-    if username:
-        profile_content += f"username={username}\n"
-    if password:
-        profile_content += f"password={password}\n"
-
-    profile_content += "view_only=" + ("yes" if data.get("view_only") else "no") + "\n"
-    profile_content += "fullscreen=" + ("yes" if data.get("fullscreen") else "no") + "\n"
-    profile_content += "shared=" + ("yes" if data.get("shared", True) else "no") + "\n"
-
-    quality = data.get("quality", "")
+    lines = [
+        "[remmina]",
+        f"name={_profile_value(data.get('_connection_name') or 'VNC Pilot')}",
+        "protocol=VNC",
+        f"server={_format_host(host)}:{port}",
+        "viewonly=%d" % (1 if data.get("view_only") else 0),
+        "disablepasswordstoring=0",
+    ]
+    if data.get("fullscreen"):
+        lines.append("viewmode=2")
+    quality = data.get("quality")
     if quality:
-        profile_content += f"quality={quality}\n"
+        lines.append("quality=%d" % _REMMINA_QUALITY.get(str(quality), 2))
+    color_depth = data.get("color_depth")
+    if color_depth and str(color_depth) in ("8", "16", "24", "32"):
+        lines.append("colordepth=%d" % int(color_depth))
+    if username:
+        lines.append(f"username={_profile_value(username)}")
+    if password:
+        lines.append(f"password={_profile_value(password)}")
 
-    # Write profile to a temp file
-    fd, profile_path = tempfile.mkstemp(prefix="remmina-vnc-", suffix=".remmina")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(profile_content)
-        os.chmod(profile_path, 0o600)
-    except OSError:
-        _safe_remove(profile_path)
-        # Fall back to URI mode
-        pass
-
-    atexit.register(lambda: _safe_remove(profile_path))
+    profile_path = _write_temp_profile(lines)
 
     argv = list(client.argv_prefix)
-    if profile_path and os.path.exists(profile_path):
+    if profile_path:
         argv += ["--connect", profile_path]
     else:
-        # URI fallback
-        uri = "vnc://"
-        if username:
-            uri += f"{username}@"
-        uri += f"{_format_host(host)}:{port}"
-        argv += ["-c", uri]
-
-    env = dict(os.environ)
-    return argv, env
+        argv += ["-c", _vnc_uri(data, host)]
+    return argv, dict(os.environ)
 
 
 def _build_krdc_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for KRDC (KDE Remote Desktop Client)."""
+    """Build argv for KRDC (KDE).
+
+    KRDC accepts ``vnc://host:port`` URIs and ignores a password on the
+    command line entirely, so it is left to prompt the user.
+    """
+    host = _get_host(data)
+    uri = _vnc_uri(data, host)
     argv = list(client.argv_prefix)
-    argv.append(f"vnc://{target}")
+    argv.append(uri)
 
     if data.get("fullscreen"):
         argv.append("-f")
 
-    # KRDC ignores most CLI args; settings come from profiles
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
-
-    env = dict(os.environ)
-    if password:
-        env["VNC_PASSWORD"] = password
-
-    return argv, env
+    argv += _extra_args_list(data)
+    return argv, dict(os.environ)
 
 
 def _build_vinagre_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for Vinagre (GNOME)."""
-    # Vinagre uses vnc:// URIs
-    host_part = target
+    """Build argv for Vinagre (GNOME).
+
+    Vinagre accepts ``vnc://host:port`` URIs and cannot take a password on
+    the command line, so it is left to prompt the user.
+    """
+    host = _get_host(data)
+    uri = _vnc_uri(data, host)
     argv = list(client.argv_prefix)
-    argv.append(f"vnc://{host_part}")
+    argv.append(uri)
 
     if data.get("fullscreen"):
         argv.append("--fullscreen")
 
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
-
-    env = dict(os.environ)
-    if password:
-        env["VNC_PASSWORD"] = password
-
-    return argv, env
+    argv += _extra_args_list(data)
+    return argv, dict(os.environ)
 
 
 def _build_gvncviewer_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Build argv for gvncviewer (gtk-vnc)."""
+    """Build argv for gvncviewer (gtk-vnc).
+
+    gvncviewer exposes no command-line options at all (no fullscreen,
+    view-only, color depth or password file), so it is launched with a
+    ``host::port`` target and prompts for the password itself. Any
+    client-specific flags must be passed via ``extra_args``.
+    """
+    host = _get_host(data)
+    target = _resolve_target(data, host)
     argv = list(client.argv_prefix)
     argv.append(target)
 
-    if data.get("view_only"):
-        argv.append("-v")
-    if data.get("fullscreen"):
-        argv.append("-f")
-    if data.get("shared", True):
-        argv.append("-s")
-
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
-
-    env = dict(os.environ)
-    if password:
-        passwd_file = _create_passwd_file(password)
-        if passwd_file:
-            argv.append("-p")
-            argv.append(passwd_file)
-
-    return argv, env
+    argv += _extra_args_list(data)
+    return argv, dict(os.environ)
 
 
 def _build_custom_argv(
-    client: VncClientInfo,
-    target: str,
-    data: dict,
-    password: str,
+    client: VncClientInfo, data: dict, password: str,
 ) -> Tuple[List[str], Dict[str, str]]:
     """Build argv for a user-specified custom VNC client.
 
-    Just appends ``host:port`` (or ``host::port``), password via temp
-    file (if the client is known to accept ``-passwd``), and raw
-    ``extra_args`` from the user.
+    This is a best-effort passthrough: ``host::port`` target plus raw
+    ``extra_args``. The ``-passwd`` option is assumed to be TigerVNC-style,
+    which is the most common convention; if the custom client uses different
+    flags, pass them via ``extra_args``.
     """
+    host = _get_host(data)
+    target = _resolve_target(data, host)
     argv = list(client.argv_prefix)
     argv.append(target)
 
-    extra = data.get("extra_args", "").strip()
-    if extra:
-        argv.extend(extra.split())
+    argv += _extra_args_list(data)
 
     env = dict(os.environ)
     if password:
         passwd_file = _create_passwd_file(password)
         if passwd_file:
-            argv.append("-passwd")
-            argv.append(passwd_file)
-
+            argv += ["-passwd", passwd_file]
     return argv, env
 
 
-# Dispatch table
 _BUILDERS = {
     "tigervnc": _build_tiger_argv,
-    "turbovnc": _build_tiger_argv,  # same CLI as TigerVNC
+    "turbovnc": _build_tiger_argv,
     "tightvnc": _build_tightvnc_argv,
     "realvnc": _build_realvnc_argv,
     "remmina": _build_remmina_argv,
@@ -908,14 +986,20 @@ class VncBackend(ProtocolBackend):
             placeholder="username (optional for most VNC servers)"))
         fields.append(FieldSpec(
             key="credential", label="Password", kind="password",
-            placeholder="password (stored in system keyring)"))
+            placeholder="password (stored in system keyring; max 8 chars)"))
 
-        # Build dynamic choices from discovered clients
+        # The client is always chosen explicitly: either from the installed
+        # clients discovered on this system, or 'custom' with a binary path.
         choices = self._vnc_client_choices()
+        first = choices[0][0] if choices else ""
         fields.append(FieldSpec(
             key="vnc_client", label="VNC Client", kind="choice",
-            default=choices[0][0] if choices else "", choices=choices,
-            placeholder="Select a VNC client"))
+            # With no client installed only 'custom' is offered: leave the
+            # selection empty so validate() shows the install-a-client
+            # warning instead of silently defaulting to Custom.
+            default="" if first == "custom" else first,
+            choices=choices,
+            placeholder="Select a VNC client installed on this system"))
 
         # --- Display ---
         fields.append(FieldSpec(
@@ -938,12 +1022,15 @@ class VncBackend(ProtocolBackend):
             default="", choices=_ENCODING, group="Display"))
         fields.append(FieldSpec(
             key="color_depth", label="Color depth", kind="choice",
-            default="", choices=_COLOR_DEPTH, group="Display"))
+            # 24-bit truecolor is more than enough for comfortable work and
+            # cuts network traffic substantially vs 32-bit; users can still
+            # pick another depth or Auto per connection.
+            default="24", choices=_COLOR_DEPTH, group="Display"))
         fields.append(FieldSpec(
             key="extra_args", label="Extra CLI arguments", kind="text",
-            placeholder="-via gateway.example.com (raw string, appended to argv)"))
+            placeholder="-via user@gateway (quotes supported, appended to argv)"))
 
-        # --- TigerVNC / TurboVNC (shared CLI) ---
+        # --- TigerVNC ---
         fields.append(FieldSpec(
             key="tigervnc_geometry", label="Geometry", kind="text",
             placeholder="e.g. 1280x720", group="TigerVNC"))
@@ -959,43 +1046,45 @@ class VncBackend(ProtocolBackend):
 
         # --- TurboVNC ---
         fields.append(FieldSpec(
+            key="turbovnc_geometry", label="Geometry (DesktopSize)",
+            kind="text", placeholder="e.g. 1280x720", group="TurboVNC"))
+        fields.append(FieldSpec(
+            key="turbovnc_via", label="SSH tunnel via", kind="text",
+            placeholder="e.g. user@gateway", group="TurboVNC"))
+        fields.append(FieldSpec(
             key="turbovnc_jpeg", label="Force JPEG compression",
             kind="switch", default=False, group="TurboVNC"))
         fields.append(FieldSpec(
-            key="turbovnc_local", label="Local cursor feedback",
+            key="turbovnc_local", label="Local cursor",
             kind="switch", default=True, group="TurboVNC"))
-
-        # --- Remmina ---
-        fields.append(FieldSpec(
-            key="remmina_sftp", label="Enable SFTP",
-            kind="switch", default=False, group="Remmina"))
 
         # --- Custom ---
         fields.append(FieldSpec(
             key="custom_binary", label="Custom binary path", kind="text",
-            placeholder="/path/to/vncviewer", group="Custom"))
+            placeholder="/path/to/vncviewer or a name on PATH",
+            group="Custom"))
 
         return fields
 
-    def _vnc_client_choices(self) -> list[tuple[str, str]]:
-        """Build the vnc_client choice list from discovered clients.
+    def _vnc_client_choices(self) -> List[tuple[str, str]]:
+        """Build the vnc_client choice list.
 
-        Falls back to 'auto' if no clients are found yet.
+        Contains every client installed on this system, plus an explicit
+        'custom' entry. There is intentionally no 'auto' option: selection
+        must be unambiguous. With no clients installed the list still offers
+        'custom', and validate() reports the missing-client warning.
         """
-        discovered = _discover_vnc_clients()
-        choices: list[tuple[str, str]] = []
-        for c in discovered:
-            choices.append((c.client_id, c.display_name))
-        if not choices:
-            choices.append(("auto", "Auto-detect (no client found)"))
-        else:
-            choices.insert(0, ("auto", "Auto-detect"))
+        choices: List[tuple[str, str]] = []
+        for client in _discover_vnc_clients():
+            choices.append((client.client_id, client.display_name))
+        choices.append(("custom", "Custom (binary path below)"))
         return choices
 
-    def validate(self, data: dict[str, Any]) -> list[str]:
-        errors: list[str] = []
-        if not _get_host(data):
-            errors.append("Host is required.")
+    def validate(self, data: dict[str, Any]) -> List[str]:
+        errors: List[str] = []
+        host_error = _validate_host(_get_host(data))
+        if host_error:
+            errors.append(host_error)
         port = _parse_port(data.get("port"), self.default_port)
         if port is None:
             errors.append("Port must be an integer between 1 and 65535.")
@@ -1007,24 +1096,50 @@ class VncBackend(ProtocolBackend):
                     errors.append("Display number must be non-negative.")
             except (TypeError, ValueError):
                 errors.append("Display must be a number.")
+        errors.extend(self._validate_client(data))
         return errors
 
+    def _validate_client(self, data: dict[str, Any]) -> List[str]:
+        custom = (data.get("custom_binary") or "").strip()
+        if custom:
+            try:
+                _resolve_custom_binary(custom)
+                return []
+            except ProtocolError as exc:
+                return [str(exc)]
+        selected = (data.get("vnc_client") or "").strip()
+        discovered = _discover_vnc_clients()
+        if selected == "custom":
+            return ["Custom binary path is required when 'Custom' is selected."]
+        if selected:
+            if any(c.client_id == selected for c in discovered):
+                return []
+            return [
+                f"VNC client '{selected}' is not installed on this system. "
+                "Install it or pick another client."]
+        if not discovered:
+            return [
+                "No VNC client was found on this system. Install one of: "
+                "TigerVNC, TurboVNC, TightVNC, RealVNC, Remmina, KRDC, "
+                "Vinagre, gvncviewer — or set a custom binary path."]
+        return ["Select a VNC client."]
+
     def build_spawn(self, connection: Any, ctx: PluginContext) -> SpawnSpec:
-        data = getattr(connection, "data", None) or {}
+        raw_data = getattr(connection, "data", None) or {}
+        data = dict(raw_data)
+        data.setdefault(
+            "_connection_name",
+            (getattr(connection, "nickname", "") or "").strip())
+
         host = _get_host(data, connection)
         if not host:
             raise ProtocolError("No host configured for this connection.")
 
-        client = _resolve_client(data, ctx)
-
-        target = _resolve_target(data, host)
-        password = _resolve_password(connection, data, ctx)
+        client = _resolve_client(data)
+        password = _resolve_password(connection, raw_data, ctx)
 
         builder = _BUILDERS.get(client.client_id, _build_custom_argv)
-        if client.client_id == "remmina":
-            argv, env = builder(client, data, password)
-        else:
-            argv, env = builder(client, target, data, password)
+        argv, env = builder(client, data, password)
 
         return SpawnSpec(argv=argv, env=env)
 
@@ -1088,4 +1203,6 @@ class Plugin(SshPilotPlugin):
             logger.exception("Failed to patch ConnectionDialog")
 
     def deactivate(self) -> None:
-        pass
+        # Remove any leftover temporary password/profile files. atexit covers
+        # interpreter exit; this covers plugin disable within a running app.
+        _cleanup_temp_files()
