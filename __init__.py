@@ -488,11 +488,11 @@ def _create_passwd_file(password: str) -> Optional[str]:
     """Create a temporary VNC password file (mode 0o600).
 
     The password is converted with ``vncpasswd -f`` when available, producing
-    the DES-encrypted format that every CLI viewer expects. When conversion
-    is not possible we log a warning and fall back to a plain-text file:
-    a handful of viewers accept it, but the standard clients (TigerVNC,
-    TurboVNC, TightVNC, RealVNC) will fail authentication without the
-    encrypted format.
+    the DES-encrypted format that the standard CLI viewers expect. When
+    conversion is not possible we deliberately do NOT pass a plain-text file
+    (the standard clients would reject it with a confusing "password
+    incorrect" error): we return ``None`` so the viewer prompts for the
+    password itself, and log a warning with install instructions.
 
     VNC passwords are limited to 8 characters by the protocol; longer
     passwords are truncated with a warning, mirroring ``vncpasswd``.
@@ -516,31 +516,36 @@ def _create_passwd_file(password: str) -> Optional[str]:
         return None
 
     vncpasswd = shutil.which("vncpasswd")
-    if vncpasswd:
-        try:
-            result = subprocess.run(
-                [vncpasswd, "-f"],
-                input=password,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.stdout:
-                with open(path, "wb") as f:
-                    f.write(result.stdout.encode())
-            else:
-                logger.warning(
-                    "vncpasswd produced no output; passing a plain-text "
-                    "password file, which standard viewers will reject.")
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            logger.warning(
-                "Failed to convert the password to VNC format with "
-                "vncpasswd; passing a plain-text password file instead.")
-    else:
+    if vncpasswd is None:
+        _safe_remove(path)
         logger.warning(
-            "vncpasswd was not found on PATH; passing a plain-text password "
-            "file, which standard viewers will reject. Install the VNC "
-            "client tools (vncpasswd) for reliable password authentication.")
+            "vncpasswd was not found on PATH, so the saved password cannot "
+            "be embedded: the VNC viewer will ask for it manually. Install "
+            "the TigerVNC tools to enable automatic password entry (e.g. "
+            "'sudo apt install tigervnc-common' or 'sudo dnf install "
+            "tigervnc').")
+        return None
+
+    try:
+        result = subprocess.run(
+            [vncpasswd, "-f"],
+            input=password,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if not result.stdout:
+            raise ValueError("vncpasswd produced no output")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        _safe_remove(path)
+        logger.warning(
+            "vncpasswd failed to convert the password to VNC format, so "
+            "the saved password cannot be embedded: the VNC viewer will "
+            "ask for it manually.")
+        return None
+
+    with open(path, "wb") as f:
+        f.write(result.stdout.encode())
 
     _track_temp_file(path)
     return path
@@ -689,9 +694,15 @@ def _build_tiger_argv(
     if via:
         argv += ["-via", str(via)]
 
-    if not data.get("tigervnc_accept_clipboard", True):
+    # Neutral field names shared by both viewers; the legacy tigervnc_* keys
+    # are still honored for connections saved before the rename.
+    accept_clipboard = data.get(
+        "accept_clipboard", data.get("tigervnc_accept_clipboard", True))
+    send_clipboard = data.get(
+        "send_clipboard", data.get("tigervnc_send_clipboard", True))
+    if not accept_clipboard:
         argv.append("-RecvClipboard=0" if is_turbo else "-AcceptClipboard=0")
-    if not data.get("tigervnc_send_clipboard", True):
+    if not send_clipboard:
         argv.append("-SendClipboard=0" if is_turbo else "-SendClipboard=0")
 
     if is_turbo:
@@ -1026,6 +1037,14 @@ class VncBackend(ProtocolBackend):
             # cuts network traffic substantially vs 32-bit; users can still
             # pick another depth or Auto per connection.
             default="24", choices=_COLOR_DEPTH, group="Display"))
+        # Clipboard switches shared by TigerVNC and TurboVNC (neutral names;
+        # the legacy tigervnc_* keys are still read as a fallback).
+        fields.append(FieldSpec(
+            key="accept_clipboard", label="Accept clipboard",
+            kind="switch", default=True, group="Display"))
+        fields.append(FieldSpec(
+            key="send_clipboard", label="Send clipboard",
+            kind="switch", default=True, group="Display"))
         fields.append(FieldSpec(
             key="extra_args", label="Extra CLI arguments", kind="text",
             placeholder="-via user@gateway (quotes supported, appended to argv)"))
@@ -1037,13 +1056,6 @@ class VncBackend(ProtocolBackend):
         fields.append(FieldSpec(
             key="tigervnc_via", label="SSH tunnel via", kind="text",
             placeholder="e.g. user@gateway", group="TigerVNC"))
-        fields.append(FieldSpec(
-            key="tigervnc_accept_clipboard", label="Accept clipboard",
-            kind="switch", default=True, group="TigerVNC"))
-        fields.append(FieldSpec(
-            key="tigervnc_send_clipboard", label="Send clipboard",
-            kind="switch", default=True, group="TigerVNC"))
-
         # --- TurboVNC ---
         fields.append(FieldSpec(
             key="turbovnc_geometry", label="Geometry (DesktopSize)",

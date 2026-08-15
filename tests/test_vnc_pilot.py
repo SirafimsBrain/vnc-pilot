@@ -139,10 +139,16 @@ def mock_version_subprocess(monkeypatch):
 
 
 def _make_discovery(which_map, version_outputs=None):
-    """Install fake shutil.which + version output for client discovery."""
+    """Install fake shutil.which + version output for client discovery.
+
+    Also makes ``vncpasswd`` available so password-file creation works; its
+    output echoes the plaintext input for deterministic assertions.
+    """
     version_outputs = version_outputs or {}
 
     def fake_which(name):
+        if name == "vncpasswd":
+            return "/usr/bin/vncpasswd"
         return which_map.get(name)
 
     def fake_run(args, **kwargs):
@@ -151,7 +157,9 @@ def _make_discovery(which_map, version_outputs=None):
             stdout = ""
             stderr = ""
         binary = os.path.basename(args[0])
-        if binary in version_outputs:
+        if binary == "vncpasswd":
+            Result.stdout = kwargs.get("input") or "ENC"
+        elif binary in version_outputs:
             Result.stdout = version_outputs[binary]
         return Result()
 
@@ -417,6 +425,8 @@ def test_connection_fields_groups():
     assert groups["host"] == "general"
     assert groups["vnc_client"] == "general"
     assert groups["view_only"] == "Display"
+    assert groups["accept_clipboard"] == "Display"
+    assert groups["send_clipboard"] == "Display"
     assert groups["tigervnc_geometry"] == "TigerVNC"
     assert groups["turbovnc_jpeg"] == "TurboVNC"
     assert groups["custom_binary"] == "Custom"
@@ -523,13 +533,26 @@ def test_build_spawn_tigervnc_clipboard(monkeypatch):
     backend = vnc.VncBackend()
     conn = _FakeConnection({
         "host": "h", "vnc_client": "tigervnc",
-        "tigervnc_accept_clipboard": False, "tigervnc_send_clipboard": False})
+        "accept_clipboard": False, "send_clipboard": False})
     ctx, _ = make_ctx()
     spawn = backend.build_spawn(conn, ctx)
     assert "-AcceptClipboard=0" in spawn.argv
     assert "-SendClipboard=0" in spawn.argv
     # The two-token form would leave a stray '0' positional argument.
     assert spawn.argv.count("0") == 0
+
+
+def test_build_spawn_tigervnc_clipboard_legacy_keys(monkeypatch):
+    """Connections saved with the old tigervnc_* keys keep working."""
+    _make_tigervnc()
+    backend = vnc.VncBackend()
+    conn = _FakeConnection({
+        "host": "h", "vnc_client": "tigervnc",
+        "tigervnc_accept_clipboard": False, "tigervnc_send_clipboard": False})
+    ctx, _ = make_ctx()
+    spawn = backend.build_spawn(conn, ctx)
+    assert "-AcceptClipboard=0" in spawn.argv
+    assert "-SendClipboard=0" in spawn.argv
 
 
 def test_build_spawn_tigervnc_color_depth(monkeypatch):
@@ -600,7 +623,7 @@ def test_build_spawn_turbovnc_flags(monkeypatch):
         "encoding": "ZRLE", "quality": "9", "compress": "3",
         "turbovnc_geometry": "1280x720", "shared": False,
         "turbovnc_jpeg": True, "turbovnc_local": False,
-        "tigervnc_accept_clipboard": False, "tigervnc_send_clipboard": False})
+        "accept_clipboard": False, "send_clipboard": False})
     ctx, _ = make_ctx()
     spawn = backend.build_spawn(conn, ctx)
     argv = spawn.argv
@@ -884,13 +907,37 @@ def test_password_truncated_to_8_chars(caplog, monkeypatch):
     assert content == "12345678"
 
 
-def test_plaintext_fallback_warns(caplog, monkeypatch):
-    """Without vncpasswd the plugin must warn, not silently pass plaintext."""
+def test_no_vncpasswd_warns_and_prompts(caplog, monkeypatch):
+    """Without vncpasswd the plugin must warn with an install hint and NOT
+    pass a plaintext file (standard viewers would reject it): it returns
+    None so the client prompts for the password instead."""
     _make_tigervnc()
     vnc.shutil.which = lambda name: "/usr/bin/vncviewer" if name == "vncviewer" else None
     with caplog.at_level(logging.WARNING):
-        vnc._create_passwd_file("pw")
-    assert any("vncpasswd was not found" in r.message for r in caplog.records)
+        assert vnc._create_passwd_file("pw") is None
+    assert any(
+        "vncpasswd" in r.message and "install" in r.message.lower()
+        for r in caplog.records)
+    assert vnc._TEMP_FILES == []
+
+
+def test_vncpasswd_failure_warns_and_prompts(caplog, monkeypatch):
+    """If vncpasswd runs but produces no output, prompt instead of passing
+    a plaintext file."""
+    _make_tigervnc()
+
+    def fake_run(args, **kwargs):
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "boom"
+        return Result()
+
+    monkeypatch.setattr(vnc.subprocess, "run", fake_run)
+    with caplog.at_level(logging.WARNING):
+        assert vnc._create_passwd_file("pw") is None
+    assert any("vncpasswd" in r.message for r in caplog.records)
+    assert vnc._TEMP_FILES == []
 
 
 def test_legacy_password_migrated_to_keyring(monkeypatch):
@@ -904,6 +951,7 @@ def test_legacy_password_migrated_to_keyring(monkeypatch):
 
 
 def test_temp_files_cleaned_on_deactivate(monkeypatch):
+    _make_tigervnc()
     path = vnc._create_passwd_file("pw")
     assert path is not None and os.path.exists(path)
     assert path in vnc._TEMP_FILES

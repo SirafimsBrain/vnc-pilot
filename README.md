@@ -119,6 +119,11 @@ used when building the command line:
 - **Custom**: `host::port` target + raw `extra_args`; `-passwd <file>` is
   assumed TigerVNC-style (pass different flags via `extra_args`).
 
+The `accept_clipboard` / `send_clipboard` switches (group **Display**) apply
+to both TigerVNC and TurboVNC (`-AcceptClipboard=0` / `-SendClipboard=0` and
+`-RecvClipboard=0` / `-SendClipboard=0` respectively). The old `tigervnc_*`
+keys are still read as a fallback for connections saved before the rename.
+
 ## Passwords
 
 - Passwords are stored **only in the SSH Pilot backend** (system keyring via
@@ -132,8 +137,12 @@ used when building the command line:
   Pilot exits or the plugin is disabled.
 - VNC protocol authentication is limited to **8 characters**; longer
   passwords are truncated with a warning.
-- If `vncpasswd` is not installed, the plugin logs a warning that plain-text
-  password files are rejected by the standard CLI viewers.
+- If `vncpasswd` is not installed (or fails to convert), the plugin does not
+  pass a plain-text file — the standard viewers would reject it with a
+  confusing "password incorrect" error. Instead it logs a warning with
+  install instructions (e.g. `sudo apt install tigervnc-common` or
+  `sudo dnf install tigervnc`) and the viewer prompts for the password
+  manually.
 
 ## Limitations (v0.2)
 
